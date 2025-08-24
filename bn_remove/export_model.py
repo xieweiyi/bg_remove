@@ -29,12 +29,12 @@ def get_args():
     ap.add_argument(
         "--model-id",
         type=str,
-        default="ZhengPeng7/BiRefNet-portrait",
+        default="ZhengPeng7/BiRefNet_lite-matting",
         help="Hugging Face model id",
     )
     ap.add_argument(
         "--onnx-out",
-        default="D:/data/BiRefNet-portrait-epoch_150.fp16.onnx",
+        default="D:/data/BiRefNet_lite-matting.onnx",
         type=str,
         help="Output ONNX filename (final FP16 model)",
     )
@@ -79,35 +79,34 @@ def load_hf_model(model_id: str):
 
 
 @torch.no_grad()
-def export_fp32_then_fp16(model, out_path: str, height: int, width: int, opset: int, dynamic: bool, keep_io_fp32: bool):
+def export_fp32(model, out_path: str, height: int, width: int, opset: int, dynamic: bool, keep_io_fp32: bool):
     model.eval()
     # Exporters are most stable with FP32 dummy inputs
     dummy = torch.randn(1, 3, height, width, dtype=torch.float32)
 
     input_layer_names = ['input_image']
     output_layer_names = ['output_image']
-    tmp_fp32 = Path(out_path).with_suffix(".fp32.onnx")
     deform_conv2d_onnx_exporter.register_deform_conv2d_onnx_op()
     print("[info] Exporting FP32 ONNX …")
     torch.onnx.export(
         model,
         dummy,
-        tmp_fp32,
+        out_path,
         verbose=False,
         opset_version=opset,
         input_names=input_layer_names,
         output_names=output_layer_names,
     )
-    print(f"[ok] FP32 ONNX exported: {tmp_fp32}")
+    print(f"[ok] FP32 ONNX exported: {out_path}")
 
-    print("[info] Converting ONNX to FP16 …")
-    model_onnx = onnx.load(str(tmp_fp32))
-    fp16_model = float16.convert_float_to_float16(
-        model_onnx,
-        keep_io_types=keep_io_fp32,  # True -> FP16 weights with FP32 I/O; False -> FP16 I/O too
-    )
-    onnx.save(fp16_model, out_path)
-    print(f"[ok] FP16 ONNX saved: {out_path}")
+    # print("[info] Converting ONNX to FP16 …")
+    # model_onnx = onnx.load(str(tmp_fp32))
+    # fp16_model = float16.convert_float_to_float16(
+    #     model_onnx,
+    #     keep_io_types=keep_io_fp32,  # True -> FP16 weights with FP32 I/O; False -> FP16 I/O too
+    # )
+    # onnx.save(fp16_model, out_path)
+    # print(f"[ok] FP16 ONNX saved: {out_path}")
 
 
 
@@ -117,7 +116,7 @@ def main():
         raise SystemExit("[error] Use opset >= 13 (17 recommended).")
 
     model = load_hf_model(args.model_id)
-    export_fp32_then_fp16(
+    export_fp32(
         model=model,
         out_path=args.onnx_out,
         height=args.height,
@@ -126,7 +125,6 @@ def main():
         dynamic=(not args.no_dynamic),
         keep_io_fp32=args.keep_io_fp32,
     )
-    print("\n[done] ONNX FP16 export complete. Use the same pre/post-processing as HF inference.")
 
 
 if __name__ == "__main__":

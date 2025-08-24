@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "python debugger: current file",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "--model-id", "ZhengPeng7/BiRefNet_lite-matting",
+                "--onnx-out", "D:/data/BiRefNet_lite-matting.onnx",
+                "--height", "512",
+                "--width", "512",
+                "--opset", "19", "--keep-io-fp32", "--no-dynamic",
+            ]
+        }
+    ]
+}
