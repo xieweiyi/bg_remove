@@ -1,0 +1,5 @@
+transformers
+huggingface-hub>0.25
+onnx
+onnxconverter-common 
+packaging
