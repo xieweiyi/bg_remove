@@ -1,6 +1,12 @@
 transformers
 huggingface-hub>0.25
 onnx
+onnxruntime
+onnxruntime-tools
 onnxconverter-common 
 packaging
-torch
+torch>= 2.1
+einops 
+kornia 
+timm 
+torchvision
