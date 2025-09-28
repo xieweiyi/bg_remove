@@ -10,3 +10,4 @@ einops
 kornia 
 timm 
 torchvision
+opencv-python-headless==4.12.0.88

@@ -44,7 +44,7 @@ import inspect
 import onnxruntime as ort
 
 
-IMAGE_SIZE = (512, 512)
+IMAGE_SIZE = (256, 256)
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -137,7 +137,7 @@ def main() -> None:
     parser.add_argument(
         "--ops",
         nargs="+",
-        default=None,
+        default=["Conv", "MatMul"],
         help="Limit op types to quantize (e.g., Conv MatMul) to reduce calibration memory",
     )
     args = parser.parse_args()
@@ -156,6 +156,9 @@ def main() -> None:
         # Configure ONNX Runtime session options to lower memory pressure during calibration inference
         so = ort.SessionOptions()
         so.intra_op_num_threads = max(1, int(args.threads))
+        os.environ["OMP_NUM_THREADS"] = str(args.threads)
+        os.environ["MKL_NUM_THREADS"] = str(args.threads)   
+        os.environ["ORT_LOG_SEVERITY_LEVEL"] = "3"
         if args.sequential:
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         # Graph optimization level
@@ -186,7 +189,7 @@ def main() -> None:
             model_output=str(args.output_model),
             calibration_data_reader=reader,
             quant_format=QuantFormat.QDQ,
-            activation_type=QuantType.QInt8,
+            activation_type=QuantType.QUInt8,
             weight_type=QuantType.QInt8,
             calibrate_method=method,
             per_channel=args.per_channel,
@@ -199,6 +202,14 @@ def main() -> None:
             qs_kwargs["providers"] = ["CPUExecutionProvider"]
         if "provider_options" in qs_sig.parameters:
             qs_kwargs["provider_options"] = None
+        # Prefer asymmetric activations (UInt8) and symmetric weights (Int8) if supported
+        if "extra_options" in qs_sig.parameters:
+            qs_kwargs["extra_options"] = {
+                "ActivationSymmetric": False,
+                "WeightSymmetric": True,
+                # Enable QDQ in subgraphs if any exist
+                "EnableSubgraph": True,
+            }
 
         quantize_static(**qs_kwargs)
         print(f"Saved statically-quantized (INT8) model to: {args.output_model}")

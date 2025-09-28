@@ -9,12 +9,12 @@
             "console": "integratedTerminal",
             "args": [
                 "--model-id", "ZhengPeng7/BiRefNet_lite-matting",
-                "--onnx-out", "D:/data/BiRefNet_lite-matting.onnx",
-                "--height", "512",
-                "--width", "512",
+                "--onnx-out", "D:/data/BiRefNet_lite-matting256.onnx",
+                "--height", "256",
+                "--width", "256",
                 "--opset", "19", "--keep-io-fp32", "--no-dynamic",
-                // "--src_model_path", "D:/workspace/repo/idphoto/resources/beautification_models/GFPGANv1.4.pth",
-                // "--dst_model_path", "D:/workspace/repo/idphoto/resources/beautification_models/GFPGANv1.4.onnx",
+                // "--src_model_path", "D:/data/models/GFPGANv1.4.pth",
+                // "--dst_model_path", "D:/data/models/GFPGANv1.4.onnx",
                 // "--img_size", "512",
             ]
         }

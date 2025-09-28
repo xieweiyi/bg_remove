@@ -84,13 +84,3 @@ ort_outs = ort_session.run(None, ort_inputs)
 print('onnxruntime infer time:', timeit.default_timer()-t)
 print(ort_outs[0].shape)
 
-# python torch2onnx.py  --src_model_path ./experiments/pretrained_models/GFPGANCleanv1-NoCE-C2.pth --dst_model_path ./GFPGAN.onnx --img_size 512 
-
-# 新版本
-
-
-# wget https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth
-
-# python torch2onnx.py  --src_model_path ./GFPGANv1.4.pth --dst_model_path ./GFPGANv1.4.onnx --img_size 512 
-
-# python torch2onnx.py  --src_model_path ./GFPGANCleanv1-NoCE-C2.pth --dst_model_path ./GFPGANv1.2.onnx --img_size 512 
