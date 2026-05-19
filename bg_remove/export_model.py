@@ -33,6 +33,12 @@ def get_args():
         help="Hugging Face model id",
     )
     ap.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        help="Optional local .pth checkpoint (overrides HF pretrained weights)",
+    )
+    ap.add_argument(
         "--onnx-out",
         default="D:/data/BiRefNet_lite-matting.onnx",
         type=str,
@@ -69,12 +75,38 @@ def get_args():
     return ap.parse_args()
 
 
-def load_hf_model(model_id: str):
-    print(f"[info] Loading {model_id} from Hugging Face (pretrained weights) …")
+def _strip_checkpoint_prefix(state_dict):
+    prefixes = ("module._orig_mod.", "module.", "_orig_mod.")
+    cleaned = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for prefix in prefixes:
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix) :]
+                break
+        cleaned[new_key] = value
+    return cleaned
+
+
+def load_hf_model(model_id: str, weights_path: str | None = None):
+    print(f"[info] Loading {model_id} from Hugging Face …")
     model = AutoModelForImageSegmentation.from_pretrained(
         model_id,
         trust_remote_code=True,
     )
+    if weights_path:
+        print(f"[info] Loading local weights: {weights_path}")
+        checkpoint = torch.load(weights_path, map_location="cpu")
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+        else:
+            state_dict = checkpoint
+        state_dict = _strip_checkpoint_prefix(state_dict)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[warn] Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"[warn] Unexpected keys: {len(unexpected)}")
     return model
 
 
@@ -115,7 +147,7 @@ def main():
     if args.opset < 13:
         raise SystemExit("[error] Use opset >= 13 (17 recommended).")
 
-    model = load_hf_model(args.model_id)
+    model = load_hf_model(args.model_id, args.weights)
     export_fp32(
         model=model,
         out_path=args.onnx_out,

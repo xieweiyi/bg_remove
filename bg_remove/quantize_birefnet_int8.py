@@ -18,7 +18,10 @@ Usage:
 
 Notes:
   - If --calib-dir is omitted, synthetic images are used (works but real faces yield better accuracy).
-  - Preprocessing matches app inference: RGB -> resize 512x512 -> float32 -> normalize by mean/std -> NCHW.
+  - Preprocessing matches app inference: RGB -> resize to model HxW -> float32 -> normalize by mean/std -> NCHW.
+  - Static PTQ feeds one image per ORT run (batch size 1). ORT still buffers activations for every
+    image in a stride chunk before building histograms; use --calib-stride 5 (or 10) to cap peak RAM
+    when --num-calib is large (e.g. 50).
 """
 
 from __future__ import annotations
@@ -44,23 +47,41 @@ import inspect
 import onnxruntime as ort
 
 
-IMAGE_SIZE = (256, 256)
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-def preprocess_image(path: Optional[Path]) -> np.ndarray:
+def discover_model_input_shape(model_path: Path) -> tuple[str, tuple[int, int]]:
+    model = onnx.load(str(model_path))
+    graph = model.graph
+    if not graph.input:
+        raise RuntimeError("ONNX model has no graph input")
+    inp = graph.input[0]
+    dims = inp.type.tensor_type.shape.dim
+    if len(dims) < 4:
+        raise RuntimeError(f"Expected NCHW input, got {len(dims)} dims")
+    h = dims[2].dim_value
+    w = dims[3].dim_value
+    if h <= 0 or w <= 0:
+        raise RuntimeError(
+            "Input height/width are not fixed in the ONNX graph; "
+            "re-export with --no-dynamic and explicit --height/--width."
+        )
+    return inp.name, (h, w)
+
+
+def preprocess_image(path: Optional[Path], image_size: tuple[int, int]) -> np.ndarray:
     """Load image (or generate synthetic), apply BiRefNet preprocessing, return NCHW float32."""
     if path is None:
         # synthetic RGB image with simple structure
-        arr = np.zeros((IMAGE_SIZE[1], IMAGE_SIZE[0], 3), dtype=np.uint8)
+        arr = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
         # draw simple gradients/patches
         for c in range(3):
-            arr[:, :, c] = np.linspace(0, 255, IMAGE_SIZE[0], dtype=np.uint8)
+            arr[:, :, c] = np.linspace(0, 255, image_size[0], dtype=np.uint8)
         img = Image.fromarray(arr, mode="RGB")
     else:
         img = Image.open(path).convert("RGB")
-        img = img.resize(IMAGE_SIZE, Image.LANCZOS)
+        img = img.resize(image_size, Image.LANCZOS)
 
     arr = np.asarray(img).astype(np.float32) / 255.0
     arr = (arr - MEAN) / STD
@@ -68,28 +89,23 @@ def preprocess_image(path: Optional[Path]) -> np.ndarray:
     return x
 
 
-def discover_model_input_name(model_path: Path) -> str:
-    model = onnx.load(str(model_path))
-    graph = model.graph
-    if not graph.input:
-        raise RuntimeError("ONNX model has no graph input")
-    # Prefer first input tensor name
-    return graph.input[0].name
-
-
 class ImageFolderDataReader(CalibrationDataReader):
     def __init__(
         self,
         input_name: str,
+        image_size: tuple[int, int],
         calib_dir: Optional[Path],
         num_samples: int,
         exts: Optional[List[str]] = None,
     ) -> None:
         self.input_name = input_name
+        self.image_size = image_size
         self.calib_dir = calib_dir
         self.num_samples = num_samples
         self.exts = exts or [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
         self._iter: Optional[Iterator[np.ndarray]] = None
+        self._start = 0
+        self._end = num_samples
 
         self.files: List[Optional[Path]] = []
         if calib_dir and calib_dir.exists():
@@ -100,9 +116,20 @@ class ImageFolderDataReader(CalibrationDataReader):
             # fallback to synthetic
             self.files = [None] * num_samples
 
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def set_range(self, start_index: int, end_index: int) -> None:
+        self._start = start_index
+        self._end = end_index
+        self.rewind()
+
     def get_next(self) -> Optional[Dict[str, np.ndarray]]:
         if self._iter is None:
-            self._iter = (preprocess_image(p) for p in self.files)
+            self._iter = (
+                preprocess_image(p, self.image_size)
+                for p in self.files[self._start : self._end]
+            )
         try:
             batch = next(self._iter)
             return {self.input_name: batch}
@@ -119,6 +146,13 @@ def main() -> None:
     parser.add_argument("--output-model", type=Path, required=True, help="Path to write INT8 ONNX model")
     parser.add_argument("--calib-dir", type=Path, default=None, help="Directory of calibration images")
     parser.add_argument("--num-calib", type=int, default=50, help="Number of calibration samples (static PTQ)")
+    parser.add_argument(
+        "--calib-stride",
+        type=int,
+        default=5,
+        help="Process this many calibration images per ORT pass (lowers peak RAM). "
+        "Set to 0 to load all --num-calib images at once (may OOM on large models).",
+    )
     parser.add_argument("--method", type=str, default="entropy", choices=["entropy", "minmax"], help="Calibration method")
     parser.add_argument("--per-channel", action="store_true", help="Enable per-channel quantization where supported")
     parser.add_argument("--dynamic", action="store_true", help="Use dynamic (weight-only) quantization to minimize RAM and skip calibration")
@@ -141,6 +175,9 @@ def main() -> None:
         help="Limit op types to quantize (e.g., Conv MatMul) to reduce calibration memory",
     )
     args = parser.parse_args()
+
+    input_name, image_size = discover_model_input_shape(args.input_model)
+    print(f"[info] Model input: {input_name}, size={image_size[0]}x{image_size[1]}")
 
     if args.dynamic:
         # Low-memory path: weight-only quantization; activations remain fp32
@@ -176,8 +213,13 @@ def main() -> None:
         if args.disable_mem_arena:
             so.enable_cpu_mem_arena = False
 
-        input_name = discover_model_input_name(args.input_model)
-        reader = ImageFolderDataReader(input_name, args.calib_dir, args.num_calib)
+        reader = ImageFolderDataReader(
+            input_name, image_size, args.calib_dir, args.num_calib
+        )
+        if args.calib_dir and reader.files and reader.files[0] is not None:
+            print(f"[info] Calibration images: {len(reader.files)} from {args.calib_dir}")
+        else:
+            print(f"[info] Calibration images: {len(reader.files)} synthetic")
 
         method = CalibrationMethod.Entropy if args.method == "entropy" else CalibrationMethod.MinMax
 
@@ -203,13 +245,29 @@ def main() -> None:
         if "provider_options" in qs_sig.parameters:
             qs_kwargs["provider_options"] = None
         # Prefer asymmetric activations (UInt8) and symmetric weights (Int8) if supported
+        extra_options: dict = {
+            "ActivationSymmetric": False,
+            "WeightSymmetric": True,
+            "EnableSubgraph": True,
+        }
+        stride = int(args.calib_stride)
+        if stride > 0:
+            if len(reader) % stride != 0:
+                raise SystemExit(
+                    f"[error] --num-calib ({len(reader)}) must be divisible by --calib-stride ({stride})."
+                )
+            extra_options["CalibStridedMinMax"] = stride
+            print(
+                f"[info] Strided calibration: {len(reader)} images in chunks of {stride} "
+                f"({len(reader) // stride} passes)"
+            )
+        elif len(reader) > 10:
+            print(
+                "[warn] --calib-stride 0 loads all calibration activations before histogramming; "
+                "expect high RAM use on 512x512 models."
+            )
         if "extra_options" in qs_sig.parameters:
-            qs_kwargs["extra_options"] = {
-                "ActivationSymmetric": False,
-                "WeightSymmetric": True,
-                # Enable QDQ in subgraphs if any exist
-                "EnableSubgraph": True,
-            }
+            qs_kwargs["extra_options"] = extra_options
 
         quantize_static(**qs_kwargs)
         print(f"Saved statically-quantized (INT8) model to: {args.output_model}")

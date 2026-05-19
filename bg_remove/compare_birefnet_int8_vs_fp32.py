@@ -21,7 +21,7 @@ import argparse
 import csv
 import math
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -29,7 +29,6 @@ import onnx
 import onnxruntime as ort
 
 
-IMAGE_SIZE = (256, 256)
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -39,14 +38,21 @@ def list_images(root: Path, exts: Optional[List[str]] = None) -> List[Path]:
     return [p for p in root.rglob("*") if p.suffix.lower() in exts]
 
 
-def discover_io(model_path: Path) -> Tuple[str, List[str]]:
+def discover_io(model_path: Path) -> Tuple[str, List[str], Tuple[int, int]]:
     model = onnx.load(str(model_path))
     graph = model.graph
     if not graph.input:
         raise RuntimeError("Model has no inputs")
-    input_name = graph.input[0].name
+    inp = graph.input[0]
+    input_name = inp.name
+    dims = inp.type.tensor_type.shape.dim
+    if len(dims) < 4:
+        raise RuntimeError(f"Expected NCHW input, got {len(dims)} dims")
+    h, w = dims[2].dim_value, dims[3].dim_value
+    if h <= 0 or w <= 0:
+        raise RuntimeError("Model input H/W are not fixed; cannot infer preprocess size.")
     output_names = [o.name for o in graph.output]
-    return input_name, output_names
+    return input_name, output_names, (w, h)
 
 
 def create_session(model_path: Path, threads: int = 1) -> ort.InferenceSession:
@@ -60,9 +66,9 @@ def create_session(model_path: Path, threads: int = 1) -> ort.InferenceSession:
     return sess
 
 
-def preprocess(img_path: Path) -> Tuple[np.ndarray, Image.Image]:
+def preprocess(img_path: Path, image_size: Tuple[int, int]) -> Tuple[np.ndarray, Image.Image]:
     img = Image.open(img_path).convert("RGB")
-    img_resized = img.resize(IMAGE_SIZE, Image.LANCZOS)
+    img_resized = img.resize(image_size, Image.LANCZOS)
     arr = np.asarray(img_resized).astype(np.float32) / 255.0
     arr = (arr - MEAN) / STD
     x = arr.transpose(2, 0, 1)[None]
@@ -207,18 +213,25 @@ def run(args):
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    fp32_in, _ = discover_io(Path(args.fp32))
-    int8_in, _ = discover_io(Path(args.int8))
+    fp32_in, _, fp32_size = discover_io(Path(args.fp32))
+    int8_in, _, int8_size = discover_io(Path(args.int8))
+    if fp32_size != int8_size:
+        raise SystemExit(
+            f"[error] FP32 input size {fp32_size} != INT8 input size {int8_size}"
+        )
+    print(f"[info] Model input size: {fp32_size[0]}x{fp32_size[1]}")
 
     sess_fp32 = create_session(Path(args.fp32), threads=args.threads)
     sess_int8 = create_session(Path(args.int8), threads=args.threads)
 
     bg_rgb = _parse_bg_color(args.bg)
+    metrics_path = out_dir / "metrics.csv"
+    rows: List[Dict[str, float | str]] = []
 
     for img_path in images:
         # Keep original for final compositing, but preprocess resized for model
         original = Image.open(img_path).convert("RGB")
-        x, _resized = preprocess(img_path)
+        x, _resized = preprocess(img_path, fp32_size)
 
         y32_list = sess_fp32.run(None, {fp32_in: x})
         y8_list = sess_int8.run(None, {int8_in: x})
@@ -231,8 +244,22 @@ def run(args):
         matte32 = maybe_auto_invert(matte32, args.auto_invert)
         matte8 = maybe_auto_invert(matte8, args.auto_invert)
 
+        m = compute_metrics(matte32, matte8)
+        rows.append({"image": img_path.name, **m})
+
         out_name = f"{img_path.stem}_cmp.png"
         save_side_by_side_image(original, matte32, matte8, bg_rgb, out_dir / out_name)
+
+    if rows:
+        with metrics_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["image", "MAE", "MSE", "PSNR"])
+            writer.writeheader()
+            writer.writerows(rows)
+        mae_avg = float(np.mean([r["MAE"] for r in rows]))
+        psnr_avg = float(np.mean([r["PSNR"] for r in rows]))
+        print(f"[info] Avg MAE={mae_avg:.4f}, Avg PSNR={psnr_avg:.2f} dB")
+        print(f"[info] Per-image metrics: {metrics_path}")
+
     print("Done. Side-by-side results in:", str(out_dir))
 
 
